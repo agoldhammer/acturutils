@@ -64,6 +64,10 @@ struct Args {
     #[arg(long, default_value_t = 27017)]
     remote_port: u16,
 
+    /// Break each category's count down by publication
+    #[arg(long)]
+    by_pubname: bool,
+
     /// Merge near-duplicate category labels (trim, strip trailing '.', case-fold)
     #[arg(long)]
     normalize: bool,
@@ -88,11 +92,31 @@ enum Format {
     Json,
 }
 
-/// One `$group` result row.
+/// One `$group` result row. `pubname` is present only with `--by-pubname`.
 #[derive(Debug, Deserialize)]
-struct CatCount {
+struct GroupRow {
     #[serde(rename = "_id")]
+    key: GroupKey,
+    count: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupKey {
     cat: String,
+    pubname: Option<String>,
+}
+
+/// A category and, with `--by-pubname`, its per-publication split.
+#[derive(Debug)]
+struct CatGroup {
+    cat: String,
+    count: i64,
+    pubs: Vec<PubCount>,
+}
+
+#[derive(Debug)]
+struct PubCount {
+    pubname: String,
     count: i64,
 }
 
@@ -196,25 +220,49 @@ fn normalize_key(cat: &str) -> String {
     trimmed.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
 }
 
-/// Merges variant labels. Each bucket is displayed under its most common
-/// original spelling, which keeps acronyms intact ("US Politics", not
-/// "Us Politics").
-fn merge_variants(rows: Vec<CatCount>) -> Vec<CatCount> {
-    // key -> (total, best label so far, that label's own count)
-    let mut merged: BTreeMap<String, (i64, String, i64)> = BTreeMap::new();
+/// Groups rows into categories, optionally merging label variants. A merged
+/// bucket is displayed under its most common original spelling, which keeps
+/// acronyms intact ("US Politics", not "Us Politics").
+fn build_groups(rows: Vec<GroupRow>, normalize: bool) -> Vec<CatGroup> {
+    struct Acc {
+        total: i64,
+        label: String,
+        label_count: i64,
+        pubs: BTreeMap<String, i64>,
+    }
+
+    let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
     for row in rows {
-        let key = normalize_key(&row.cat);
-        let entry = merged.entry(key).or_insert((0, row.cat.clone(), 0));
-        entry.0 += row.count;
-        if row.count > entry.2 {
-            entry.1 = row.cat.clone();
-            entry.2 = row.count;
+        // Without --normalize each distinct label is its own bucket.
+        let key = if normalize { normalize_key(&row.key.cat) } else { row.key.cat.clone() };
+        let entry = acc.entry(key).or_insert_with(|| Acc {
+            total: 0,
+            label: row.key.cat.clone(),
+            label_count: 0,
+            pubs: BTreeMap::new(),
+        });
+        entry.total += row.count;
+        // The bucket takes the name of its single largest contributing label.
+        if row.count > entry.label_count {
+            entry.label = row.key.cat.clone();
+            entry.label_count = row.count;
+        }
+        if let Some(pubname) = row.key.pubname {
+            *entry.pubs.entry(pubname).or_insert(0) += row.count;
         }
     }
 
-    let mut out: Vec<CatCount> = merged
+    let mut out: Vec<CatGroup> = acc
         .into_values()
-        .map(|(count, cat, _)| CatCount { cat, count })
+        .map(|a| {
+            let mut pubs: Vec<PubCount> = a
+                .pubs
+                .into_iter()
+                .map(|(pubname, count)| PubCount { pubname, count })
+                .collect();
+            pubs.sort_by(|x, y| y.count.cmp(&x.count).then_with(|| x.pubname.cmp(&y.pubname)));
+            CatGroup { cat: a.label, count: a.total, pubs }
+        })
         .collect();
     out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.cat.cmp(&b.cat)));
     out
@@ -224,7 +272,14 @@ async fn count_by_category(
     articles: &Collection<Document>,
     start: DateTime<Utc>,
     end: DateTime<Utc>,
-) -> Result<Vec<CatCount>> {
+    by_pubname: bool,
+) -> Result<Vec<GroupRow>> {
+    // $toString keeps the keys strings even if a stray stored value is not one.
+    let mut group_id = doc! { "cat": { "$toString": { "$ifNull": ["$cat", "(none)"] } } };
+    if by_pubname {
+        group_id.insert("pubname", doc! { "$toString": { "$ifNull": ["$pubname", "(none)"] } });
+    }
+
     let pipeline = vec![
         doc! { "$match": {
             "pubdate": {
@@ -232,11 +287,7 @@ async fn count_by_category(
                 "$lte": Bson::DateTime(BsonDateTime::from_millis(end.timestamp_millis())),
             }
         }},
-        doc! { "$group": {
-            // $toString keeps the key a string even if a stray cat value is not one.
-            "_id": { "$toString": { "$ifNull": ["$cat", "(none)"] } },
-            "count": { "$sum": 1 },
-        }},
+        doc! { "$group": { "_id": group_id, "count": { "$sum": 1 } } },
         doc! { "$sort": { "count": -1, "_id": 1 } },
     ];
 
@@ -248,14 +299,16 @@ async fn count_by_category(
     let mut rows = Vec::new();
     while cursor.advance().await? {
         let doc = cursor.current();
-        let row: CatCount =
+        let row: GroupRow =
             mongodb::bson::from_slice(doc.as_bytes()).context("unexpected $group result shape")?;
         rows.push(row);
     }
     Ok(rows)
 }
 
-fn print_table(rows: &[CatCount], total: i64, start: DateTime<Utc>, end: DateTime<Utc>) {
+const INDENT: &str = "    ";
+
+fn print_table(groups: &[CatGroup], total: i64, start: DateTime<Utc>, end: DateTime<Utc>) {
     let fmt = "%Y-%m-%d %H:%M:%S";
     println!(
         "Articles by category, {} .. {} UTC",
@@ -264,22 +317,44 @@ fn print_table(rows: &[CatCount], total: i64, start: DateTime<Utc>, end: DateTim
     );
     println!();
 
-    let width = rows.iter().map(|r| r.cat.chars().count()).max().unwrap_or(8).max(8);
-    println!("{:<width$}  {:>9}  {:>7}", "CATEGORY", "ARTICLES", "PCT", width = width);
-    println!("{}  {}  {}", "-".repeat(width), "-".repeat(9), "-".repeat(7));
+    // Indented publication rows have to fit the same column as the categories.
+    let width = groups
+        .iter()
+        .flat_map(|g| {
+            std::iter::once(g.cat.chars().count()).chain(
+                g.pubs.iter().map(|p| p.pubname.chars().count() + INDENT.len()),
+            )
+        })
+        .max()
+        .unwrap_or(8)
+        .max(8);
 
-    for row in rows {
-        let pct = if total > 0 { row.count as f64 * 100.0 / total as f64 } else { 0.0 };
-        println!(
-            "{:<width$}  {:>9}  {:>6.2}%",
-            row.cat,
-            row.count,
-            pct,
-            width = width
-        );
+    let rule = format!("{}  {}  {}", "-".repeat(width), "-".repeat(9), "-".repeat(7));
+    println!("{:<width$}  {:>9}  {:>7}", "CATEGORY", "ARTICLES", "PCT", width = width);
+    println!("{rule}");
+
+    for group in groups {
+        let pct = if total > 0 { group.count as f64 * 100.0 / total as f64 } else { 0.0 };
+        println!("{:<width$}  {:>9}  {:>6.2}%", group.cat, group.count, pct, width = width);
+
+        for pub_count in &group.pubs {
+            // Percentages here are of the category, not of the grand total.
+            let share = if group.count > 0 {
+                pub_count.count as f64 * 100.0 / group.count as f64
+            } else {
+                0.0
+            };
+            println!(
+                "{:<width$}  {:>9}  {:>6.2}%",
+                format!("{INDENT}{}", pub_count.pubname),
+                pub_count.count,
+                share,
+                width = width
+            );
+        }
     }
 
-    println!("{}  {}  {}", "-".repeat(width), "-".repeat(9), "-".repeat(7));
+    println!("{rule}");
     println!("{:<width$}  {:>9}", "TOTAL", total, width = width);
 }
 
@@ -314,26 +389,42 @@ async fn main() -> Result<()> {
     let client = Client::with_options(options)?;
     let articles = client.database(&args.db).collection::<Document>(&args.collection);
 
-    let rows = count_by_category(&articles, start, end).await?;
+    let rows = count_by_category(&articles, start, end, args.by_pubname).await?;
 
     // Category labels come straight from the model, so merging is opt-in.
-    let mut rows = if args.normalize { merge_variants(rows) } else { rows };
+    let mut groups = build_groups(rows, args.normalize);
 
     // Total covers every article in the range, including filtered-out rows.
-    let total: i64 = rows.iter().map(|r| r.count).sum();
+    let total: i64 = groups.iter().map(|g| g.count).sum();
 
-    rows.retain(|r| r.count >= args.min);
+    // --min and --top select categories; the publications within them are kept.
+    groups.retain(|g| g.count >= args.min);
     if let Some(top) = args.top {
-        rows.truncate(top);
+        groups.truncate(top);
     }
 
     match args.format {
-        Format::Table => print_table(&rows, total, start, end),
+        Format::Table => print_table(&groups, total, start, end),
         Format::Csv => {
-            println!("category,count");
-            for row in &rows {
-                // Quote and escape: labels can contain commas or quotes.
-                println!("\"{}\",{}", row.cat.replace('"', "\"\""), row.count);
+            // Quote and escape: labels can contain commas, quotes or newlines.
+            let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+            if args.by_pubname {
+                println!("category,pubname,count");
+                for group in &groups {
+                    for pub_count in &group.pubs {
+                        println!(
+                            "{},{},{}",
+                            quote(&group.cat),
+                            quote(&pub_count.pubname),
+                            pub_count.count
+                        );
+                    }
+                }
+            } else {
+                println!("category,count");
+                for group in &groups {
+                    println!("{},{}", quote(&group.cat), group.count);
+                }
             }
         }
         Format::Json => {
@@ -341,10 +432,21 @@ async fn main() -> Result<()> {
                 "start": start.to_rfc3339(),
                 "end": end.to_rfc3339(),
                 "total": total,
-                "categories": rows.iter().map(|r| serde_json::json!({
-                    "category": r.cat,
-                    "count": r.count,
-                })).collect::<Vec<_>>(),
+                "categories": groups.iter().map(|g| {
+                    let mut entry = serde_json::json!({
+                        "category": g.cat,
+                        "count": g.count,
+                    });
+                    if args.by_pubname {
+                        entry["publications"] = serde_json::json!(
+                            g.pubs.iter().map(|p| serde_json::json!({
+                                "pubname": p.pubname,
+                                "count": p.count,
+                            })).collect::<Vec<_>>()
+                        );
+                    }
+                    entry
+                }).collect::<Vec<_>>(),
             });
             println!("{}", serde_json::to_string_pretty(&out)?);
         }

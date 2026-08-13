@@ -64,11 +64,36 @@ vs `Sport`) are **not** merged — that would need a hand-written mapping.
 
 Articles with no `cat` field are counted under `(none)`.
 
+### Breaking down by publication
+
+`--by-pubname` splits each category's count across the 14 publications, sorted
+by size, with each publication's share **of its category**:
+
+```
+CATEGORY           ARTICLES      PCT
+----------------  ---------  -------
+US Politics             107    9.44%
+    NYTimes              26   24.30%
+    Guardian             19   17.76%
+    FT                   13   12.15%
+    WSJ                  10    9.35%
+...
+```
+
+The category rows keep their share of the grand total, so the two percentage
+columns answer different questions: how big is this category, and who is
+writing it.
+
+In `csv` the output becomes one `category,pubname,count` row per pair, ready to
+pivot; in `json` each category gains a `publications` array. Publications
+contributing nothing to a category are omitted rather than listed as zero.
+
 ### Options
 
 | Flag | Meaning |
 | --- | --- |
 | `-s, --start`, `-e, --end` | Range bounds (required) |
+| `--by-pubname` | Break each category's count down by publication |
 | `--normalize` | Merge whitespace/period/case variants of a label |
 | `--top N` | Show only the N largest categories |
 | `--min N` | Hide categories with fewer than N articles |
@@ -77,8 +102,9 @@ Articles with no `cat` field are counted under `(none)`.
 | `--ssh-host`, `--local-port`, `--remote-port` | Tunnel settings (default `con1`, 27017, 27017) |
 | `--uri`, `--db`, `--collection` | Mongo overrides (default `actur`, `articles`) |
 
-`--top` and `--min` only trim the displayed rows; `TOTAL` always reflects every
-article in the range.
+`--top` and `--min` select *categories* and only trim the displayed rows; the
+publications within a retained category are always shown in full, and `TOTAL`
+always reflects every article in the range.
 
 ### Notes
 
